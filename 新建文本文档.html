@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh‑CN">
+<head>
+<meta charset="UTF‑8">
+<title>线条飞机大战 P2P双人对战【免服务器点击即玩】</title>
+<meta name="viewport" content="width=device‑width, initial‑scale=1.0,maximum‑scale=1,user‑scalable=no"/>
+<style>
+*{margin:0;padding:0;box‑sizing:border‑box}
+body{background:#111;display:flex;flex‑direction:column;align‑items:center;padding:4px;font‑family:system‑ui;color:#fff}
+canvas{border:1px solid #444;background:#000;}
+#rankPanel{
+    position:absolute;
+    width:480px;
+    height:720px;
+    background:rgba(0,0,0,0.92);
+    color:#fff;
+    display:none;
+    text‑align:center;
+    padding‑top:80px;
+    z‑index:10;
+}
+#rankPanel h2{margin‑bottom:16px;font‑size:26px}
+#rankList{
+    font‑size:17px;
+    line‑height:1.7;
+    margin‑bottom:20px;
+}
+#battleRankDom{margin‑bottom:12px;font‑size:19px;color:#6cf;}
+#restartBtn{
+    padding:10px 24px;
+    font‑size:17px;
+    cursor:pointer;
+    background:#2277dd;
+    color:#fff;
+    border:none;
+    border‑radius:6px;
+}
+#uiRoom{
+    position:absolute;
+    z‑index:20;
+    background:#222;
+    padding:16px;
+    border‑radius:8px;
+    max‑width:460px;
+}
+#uiRoom input{padding:8px;width:220px;font‑size:16px}
+#uiRoom button{padding:8px 14px;margin:4px;font‑size:15px}
+.hide{display:none !important;}
+</style>
+</head>
+<body>
+<div id="uiRoom">
+    <div id="roomCreateWrap">
+        <h3>双人P2P联机房间</h3>
+        <p>创建房间后把房间ID发给好友</p>
+        <button id="btnCreate">🏠 创建房间</button>
+        <br>
+        <input id="roomIdInput" placeholder="粘贴好友房间ID">
+        <button id="btnJoin">🚀加入房间</button>
+        <div id="connStatus">等待操作...</div>
+    </div>
+    <div id="roomShareWrap" class="hide">
+        <p>你的房间ID（复制发给对手）</p>
+        <div style="font‑size:20px;color:#4f8;margin:8px 0;" id="myRoomId"></div>
+        <p id="peerState">等待对手连接...</p>
+    </div>
+</div>
+
+<div id="rankPanel">
+    <h2>对战结束</h2>
+    <div id="battleRankDom"></div>
+    <div>本局我方得分：<span id="myFinalScore"></span></div>
+    <div id="rankList"></div>
+    <button id="restartBtn">重新开始</button>
+</div>
+
+<canvas id="game" width="480" height="720"></canvas>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const rankPanel = document.getElementById("rankPanel");
+const rankListDom = document.getElementById("rankList");
+const battleRankDom = document.getElementById("battleRankDom");
+const myFinalScoreDom = document.getElementById("myFinalScore");
+const restartBtn = document.getElementById("restartBtn");
+
+// ====== P2P WebRTC 点对点联机（使用免费公共信令）======
+const SIGNAL_SERVER = "wss://signaling.yjs.dev";
+let wsSignal;
+let peerConn;
+let dataChannel;
+let isHost = false;
+let roomId = "";
+let remotePeerReady = false;
+let remoteScore = 0;
+
+const uiRoom = document.getElementById("uiRoom");
+const roomCreateWrap = document.getElementById("roomCreateWrap");
+const roomShareWrap = document.getElementById("roomShareWrap");
+const myRoomIdDom = document.getElementById("myRoomId");
+const connStatusDom = document.getElementById("connStatus");
+const peerStateDom = document.getElementById("peerState");
+const btnCreate = document.getElementById("btnCreate");
+const btnJoin = document.getElementById("btnJoin");
+const roomIdInput = document.getElementById("roomIdInput");
+
+//生随机房间ID
+function genRoomId(){
+    return Math.random().toString(36).slice(2,10);
+}
+
+//建立信令连接
+function openSignal(){
+    wsSignal = new WebSocket(SIGNAL_SERVER);
+    wsSignal.onmessage = async (ev)=>{
+        const msg = JSON.parse(ev.data);
+        if(msg.room !== roomId) return;
+        if(msg.type === "offer"){
+            await peerConn.setRemoteDescription(new RTCSessionDescription(msg.data));
+            const ans = await peerConn.createAnswer();
+            await peerConn.setLocalDescription(ans);
+            sendSignal({type:"answer", data:ans});
+        }else if(msg.type === "answer"){
+            await peerConn.setRemoteDescription(new RTCSessionDescription(msg.data));
+        }else if(msg.type === "ice"){
+            await peerConn.addIceCandidate(new RTCIceCandidate(msg.data));
+        }
+    };
+}
+function sendSignal(obj){
+    if(!wsSignal || wsSignal.readyState!==WebSocket.OPEN) return;
+    wsSignal.send(JSON.stringify({room:roomId, ...obj}));
+}
+
+async function createRoom(){
+    roomId = genRoomId();
+    isHost = true;
+    myRoomIdDom.innerText = roomId;
+    roomCreateWrap.classList.add("hide");
+    roomShareWrap.classList.remove("hide");
+    openSignal();
+    wsSignal.onopen = async ()=>{
+        peerConn = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+        dataChannel = peerConn.createDataChannel("game");
+        bindDataChannel(dataChannel);
+        peerConn.onicecandidate = e=>{
+            if(e.candidate) sendSignal({type:"ice", data:e.candidate});
+        };
+        const offer = await peerConn.createOffer();
+        await peerConn.setLocalDescription(offer);
+        sendSignal({type:"offer", data:offer});
+    }
+}
+
+async function joinRoom(){
+    roomId = roomIdInput.value.trim();
+    if(!roomId) return;
+    isHost = false;
+    roomCreateWrap.classList.add("hide");
+    roomShareWrap.classList.remove("hide");
+    myRoomIdDom.innerText = roomId;
+    openSignal();
+    wsSignal.onopen = async ()=>{
+        peerConn = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+        peerConn.ondatachannel = ev=>{
+            dataChannel = ev.channel;
+            bindDataChannel(dataChannel);
+        };
+        peerConn.onicecandidate = e=>{
+            if(e.candidate) sendSignal({type:"ice", data:e.candidate});
+        };
+    }
+}
+
+function bindDataChannel(dc){
+    dc.onopen = ()=>{
+        peerStateDom.innerText = "✅对手已连接，可以开始游戏！";
+        remotePeerReady = true;
+        uiRoom.classList.add("hide");
+        resetGame();
+    };
+    dc.onmessage = (e)=>{
+        const pkg = JSON.parse(e.data);
+        if(pkg.type === "gameOverReport"){
+            remoteScore = pkg.score;
+            renderBattleResult(score, remoteScore);
+        }
+    };
+}
+
+function sendP2P(obj){
+    if(dataChannel && dataChannel.readyState==="open"){
+        dataChannel.send(JSON.stringify(obj));
+    }
+}
+
+btnCreate.onclick = createRoom;
+btnJoin.onclick = joinRoom;
+
+//本地存储排行榜【原单机TOP10】
+function getRankList(){
+    let str = localStorage.getItem("planeRank");
+    if(!str) return [];
+    return JSON.parse(str);
+}
+function saveScore(score){
+    let arr = getRankList();
+    arr.push(score);
+    arr.sort((a,b)=>b‑a);
+    arr = arr.slice(0,10);
+    localStorage.setItem("planeRank", JSON.stringify(arr));
+    return arr;
+}
+
+//游戏结束弹窗
+function showRankPanel(finalScore){
+    rankPanel.style.display = "block";
+    myFinalScoreDom.innerText = finalScore;
+    let localList = saveScore(finalScore);
+    let html = `<br>🏆历史本地TOP10<br>`;
+    for(let i=0;i<localList.length;i++){
+        html += `${i+1}. ${localList[i]}<br>`;
+    }
+    rankListDom.innerHTML = html;
+    sendP2P({type:"gameOverReport", score:finalScore});
+    renderBattleResult(finalScore, remoteScore);
+}
+
+//渲染双人对战排名
+function renderBattleResult(my, other){
+    let arr = [{name:"我方", score:my},{name:"对手", score:other}];
+    arr.sort((a,b)=>b.score‑a.score);
+    let shtml = "";
+    arr.forEach((it,idx)=>{
+        shtml += `第${idx+1}名｜${it.name}：${it.score}分<br>`;
+    })
+    battleRankDom.innerHTML = "🏁本局对战排名<br>"+shtml;
+}
+
+restartBtn.onclick = ()=>{
+    rankPanel.style.display = "none";
+    resetGame();
+};
+
+// =========输入控制（鼠标+触屏手机）=========
+let mouseX = W/2;
+let mouseY = H ‑ 100;
+
+canvas.addEventListener('mousemove', function(e){
+    const rect = canvas.getBoundingClientRect();
+    mouseX = e.clientX ‑ rect.left;
+    mouseY = e.clientY ‑ rect.top;
+});
+canvas.addEventListener('touchmove',(e)=>{
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const t = e.touches[0];
+    mouseX = t.clientX ‑ rect.left;
+    mouseY = t.clientY ‑ rect.top;
+},{passive:false})
+
+canvas.addEventListener('click',()=>{
+    if(!gameOver) pause = !pause;
+});
+let tapCount = 0;
+canvas.addEventListener('touchend',()=>{
+    tapCount++;
+    setTimeout(()=>{tapCount=0},350);
+    if(tapCount>=2){
+        if(!pause && !gameOver && ultimateCd <= 0){
+            activateUltimate();
+        }
+    }
+})
+canvas.addEventListener('contextmenu',(e)=>{
+    e.preventDefault();
+    if(!pause && !gameOver && ultimateCd <= 0){
+        activateUltimate();
+    }
+});
+
+// =========游戏全局变量=========
+let score = 0;
+let life = 3;
+let gameOver = false;
+let pause = false;
+let bossSpawned = false;
+let level = 1;
+const BOSS_SCORE_TABLE = {
+    1:3000,
+    2:8000,
+    3:15000
+};
+const ULTIMATE_CD = 30;
+let ultimateCd = 0;
+let ultimateInvincibleTimer = 0;
+const ULTIMATE_INV_TIME = 3;
+let wingDrones = [false, false];
+const DRONE_OFFSET_X = 28;
+const DRONE_OFFSET_Y = 2;
+let droneFireCd = 0;
+const DRONE_FIRE_RATE = 1.1;
+let buffDroneEnhance = false;
+let tipText = "";
+let tipTimer = 0;
+let explosions = [];
+let trackMissiles = [];
+
+const player = {
+    x: W/2, y: H ‑ 100,
+    baseSpeed:6,
+    speed:6,
+    shootCd:0, shootRate:0.22,
+    trackCd:0, trackRate:0.7,
+    heavyCd:0, heavyRate:1.2,
+    hasShield:false,
+    buffGun:false,
+    buffSpeed:false,
+    buffShield:false,
+    buffPierce:false,
+    buffTrack:false,
+    buffHeavy:false,
+    buff5Row:false,
+    hitFlash:0,
+    draw(){
+        ctx.save();
+        ctx.translate(this.x,this.y);
+        if(ultimateInvincibleTimer > 0 && Math.floor(ultimateInvincibleTimer*10)%2 === 1){
+            ctx.restore();
+            return;
+        }
+        ctx.strokeStyle="#fff";
+        ctx.lineWidth=1;
+        ctx.beginPath();
+        ctx.moveTo(0, ‑16);
+        ctx.lineTo(‑12, 12);
+        ctx.lineTo(‑4, 8);
+        ctx.lineTo(‑4, 16);
+        ctx.lineTo(4, 16);
+        ctx.lineTo(4, 8);
+        ctx.lineTo(12, 12);
+        ctx.lineTo(0, ‑16);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(0,‑16);
+        ctx.lineTo(0,14);
+        ctx.stroke();
+        if(this.hasShield){
+            ctx.strokeStyle="#0ff";
+            ctx.beginPath();
+            ctx.arc(0,0,20,0,Math.PI*2);
+            ctx.stroke();
+        }
+        ctx.restore();
+        if(wingDrones[0]) drawDrone(this.x ‑ DRONE_OFFSET_X, this.y + DRONE_OFFSET_Y);
+        if(wingDrones[1]) drawDrone(this.x + DRONE_OFFSET_X, this.y + DRONE_OFFSET_Y);
+    },
+    update(dt){
+        const dx = mouseX ‑ this.x;
+        const dy = mouseY ‑ this.y;
+        this.x += dx * 0.12;
+        this.y += dy * 0.12;
+        this.x = Math.max(15,Math.min(W‑15,this.x));
+        this.y = Math.max(15,Math.min(H‑15,this.y));
+        if(this.hitFlash>0) this.hitFlash ‑= dt;
+        this.shootCd ‑= dt;
+        if(this.shootCd <= 0){
+            this.shootCd = this.shootRate;
+            if(this.buff5Row){
+                const rows = [
+                    {x:0, y:‑16, vx:0, vy:‑10.2},
+                    {x:‑14, y:‑16, vx:0, vy:‑10.2},
+                    {x:14, y:‑16, vx:0, vy:‑10.2},
+                    {x:‑28, y:‑16, vx:0, vy:‑10.2},
+                    {x:28, y:‑16, vx:0, vy:‑10.2}
+                ];
+                for(let s of rows){
+                    bullets.push({
+                        x: this.x + s.x,
+                        y: this.y + s.y,
+                        vx: s.vx,
+                        vy: s.vy,
+                        dmg: 1.5,
+                        pierce: this.buffPierce
+                    });
+                }
+            }else{
+                bullets.push({
+                    x:this.x,
+                    y:this.y‑16,
+                    vx:0,
+                    vy:‑10,
+                    dmg:1.5,
+                    pierce:this.buffPierce
+                });
+            }
+        }
+        this.heavyCd ‑= dt;
+        if(this.buffHeavy && this.heavyCd <=0){
+            this.heavyCd = this.heavyRate;
+            bullets.push({
+                x:this.x,
+                y:this.y‑16,
+                vx:0,
+                vy:‑6,
+                dmg:4.0,
+                pierce:false,
+                heavy:true
+            })
+        }
+        if(this.buffTrack){
+            this.trackCd ‑= dt;
+            if(this.trackCd <= 0){
+                this.trackCd = this.trackRate;
+                let nearest = findNearestEnemy(this);
+                if(nearest){
+                    trackMissiles.push({
+                        x:this.x,
+                        y:this.y‑16,
+                        target:nearest,
+                        dmg:2.5
+                    });
+                }
+            }
+        }
+        droneFireCd ‑= dt;
+        let droneRate = buffDroneEnhance ? DRONE_FIRE_RATE * 0.65 : DRONE_FIRE_RATE;
+        if(droneFireCd <= 0 && (wingDrones[0] || wingDrones[1])){
+            droneFireCd = droneRate;
+            if(this.buff5Row){
+                const rows = [
+                    {x:0, y:‑4, vx:0, vy:‑10.2},
+                    {x:‑14, y:‑4, vx:0, vy:‑10.2},
+                    {x:14, y:‑4, vx:0, vy:‑10.2},
+                    {x:‑28, y:‑4, vx:0, vy:‑10.2},
+                    {x:28, y:‑4, vx:0, vy:‑10.2}
+                ];
+                let droneDmg = buffDroneEnhance ? 1.8 :1.2;
+                for(let s of rows){
+                    if(wingDrones[0]){
+                        bullets.push({
+                            x: this.x ‑ DRONE_OFFSET_X + s.x,
+                            y: this.y + s.y,
+                            vx:s.vx, vy:s.vy,
+                            dmg: droneDmg,
+                            pierce:this.buffPierce
+                        });
+                    }
+                    if(wingDrones[1]){
+                        bullets.push({
+                            x: this.x + DRONE_OFFSET_X + s.x,
+                            y: this.y + s.y,
+                            vx:s.vx, vy:s.vy,
+                            dmg: droneDmg,
+                            pierce:this.buffPierce
+                        });
+                    }
+                }
+            }else if(this.buffHeavy){
+                let droneDmg = buffDroneEnhance ? 4.0 :4.0;
+                if(wingDrones[0]){
+                    bullets.push({
+                        x: this.x ‑ DRONE_OFFSET_X,
+                        y: this.y ‑ 4,
+                        vx:0,
+                        vy:‑6,
+                        dmg: droneDmg,
+                        pierce:false,
+                        heavy:true
+                    });
+                }
+                if(wingDrones[1]){
+                    bullets.push({
+                        x: this.x + DRONE_OFFSET_X,
+                        y: this.y ‑ 4,
+                        vx:0,
+                        vy:‑6,
+                        dmg: droneDmg,
+                        pierce:false,
+                        heavy:true
+                    });
+                }
+            }else{
+                let droneDmg = buffDroneEnhance ? 1.8 :1.2;
+                if(wingDrones[0]){
+                    bullets.push({
+                        x: this.x ‑ DRONE_OFFSET_X,
+                        y: this.y ‑ 4,
+                        vx:0,
+                        vy:‑10,
+                        dmg: droneDmg,
+                        pierce:this.buffPierce
+                    });
+                }
+                if(wingDrones[1]){
+                    bullets.push({
+                        x: this.x + DRONE_OFFSET_X,
+                        y: this.y ‑ 4,
+                        vx:0,
+                        vy:‑10,
+                        dmg: droneDmg,
+                        pierce:this.buffPierce
+                    });
+                }
+            }
+        }
+    },
+    applyBuff(type){
+        switch(type){
+            case 0: this.buff5Row = true; showTip("✅ 5行纵向弹幕已激活！",1.5);break;
+            case 1: this.buffSpeed = true;this.speed = 10;break;
+            case 2: this.buffShield = true;this.hasShield = true;showTip("✅ 护盾激活",1.2);break;
+            case 3: showTip("生命已满，无法增加",1.2);break;
+            case 4: this.buffPierce = true;showTip("✅ 穿透子弹",1.2);break;
+            case 5:
+                for(let i=enemies.length‑1;i>=0;i--){
+                    const e = enemies[i];
+                    createExplosion(e.x,e.y);score += e.score;enemies.splice(i,1);
+                }
+                if(boss){boss.hp ‑= 8;}
+                showTip("💥 全屏炸弹！",1.2);break;
+            case 6: this.buffTrack = true;showTip("✅ 追踪导弹",1.2);break;
+            case 7:
+                if(!wingDrones[0]){wingDrones[0]=true;showTip("✅ 获得左侧简笔僚机！",1.5);}
+                else if(!wingDrones[1]){wingDrones[1]=true;showTip("✅ 获得右侧简笔僚机！",1.5);}
+                else{score +=100;showTip("僚机已满，+100分",1.2);}
+                break;
+            case 8: this.buffHeavy = true;showTip("✅ 巨型重弹",1.5);break;
+            case 9: showTip("buff占位",1.0);break;
+            case 10: buffDroneEnhance = true;showTip("✅ 僚机强化！伤害射速提升",1.5);break;
+        }
+    },
+    clearStageBuff(){
+        this.buff5Row = false;this.buffSpeed = false;this.buffShield = false;
+        this.buffPierce = false;this.buffTrack = false;this.buffHeavy = false;
+        this.hasShield = false;this.speed = this.baseSpeed;buffDroneEnhance = false;
+    }
+};
+function drawDrone(x,y){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.strokeStyle="#0cf";ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(0, ‑7);ctx.lineTo(‑6, 5);ctx.lineTo(‑2, 3);ctx.lineTo(‑2, 7);
+    ctx.lineTo(2, 7);ctx.lineTo(2, 3);ctx.lineTo(6, 5);ctx.lineTo(0, ‑7);
+    ctx.stroke();
+    ctx.beginPath();ctx.moveTo(0, ‑7);ctx.lineTo(0, 6);ctx.stroke();
+    ctx.restore();
+}
+function findNearestEnemy(fromObj){
+    let nearest = null;let minDist = 9999;
+    for(let e of enemies){const d = dist(fromObj,e);if(d < minDist){minDist = d;nearest = e;}}
+    if(boss){const d = dist(fromObj,boss);if(d < minDist){nearest = boss;}}
+    return nearest;
+}
+let bullets = [];
+let enemyBullets = [];
+let enemies = [];
+let buffItems = [];
+let boss = null;
+let spawnTimer = 0;
+function dist(a,b){
+    const dx = a.x ‑ b.x;const dy = a.y ‑ b.y;
+    return Math.sqrt(dx*dx + dy*dy);
+}
+function createExplosion(x,y){
+    explosions.push({x:x,y:y,timer:0.4,maxR:30});
+}
+function activateUltimate(){
+    ultimateCd = ULTIMATE_CD;ultimateInvincibleTimer = ULTIMATE_INV_TIME;
+    for(let i=enemies.length‑1;i>=0;i--){
+        const e = enemies[i];createExplosion(e.x,e.y);score += e.score;enemies.splice(i,1);
+    }
+    enemyBullets = [];
+    showTip("【大招释放！无敌3秒，清除全部敌机】",2);
+}
+function showTip(text, duration=2){tipText = text;tipTimer = duration;}
+function spawnEnemy(){
+    const rd = Math.random();let type,hp,sc,speed;
+    const stageBonus = (score / 3000 * 0.3) + (level‑1)*0.25;
+    if(rd < 0.35){ hp = 2 + stageBonus;sc = 10;speed = 2 + stageBonus; }
+    else if(rd < 0.62){ hp = 2 + stageBonus;sc = 15;speed = 3.5 + stageBonus; }
+    else{ hp = 6 + stageBonus*2;sc = 30;speed = 1.2 + stageBonus; }
+    const moveList = [0,1,2,3,4,6];
+    let moveType = moveList[Math.floor(Math.random()*moveList.length)];
+    enemies.push({
+        x:Math.random()*(W‑80)+40,y:‑30,hp:hp,score:sc,
+        shootCd:0,shootRate:Math.max(1.2,4.4 ‑ stageBonus*0.4),
+        type,spd:speed,moveType: moveList[Math.floor(Math.random()*moveList.length)],
+        baseX:0,time:0,turnFlag:true,dashTrigger:false
+    });
+    enemies[enemies.length‑1].baseX = enemies[enemies.length‑1].x;
+}
+function spawnBoss(){
+    const levelMult = 1 + (level‑1)*0.6;
+    boss = {
+        x:W/2,y:‑80,
+        hp:(20 + (score/1000)*8)*levelMult,
+        maxHp:(20 + (score/1000)*8)*levelMult,
+        shootCd:0,shootRate:1.6 / (1+(level‑1)*0.15),phase:1
+    };
+    bossSpawned = true;
+    showTip(`⚠️ 第${level}关BOSS登场！`,2);
+}
+function drawEnemy0(e){ctx.save();ctx.translate(e.x,e.y);ctx.strokeStyle="#f88";ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(0,12);ctx.lineTo(‑8,‑8);ctx.lineTo(‑3,‑5);ctx.lineTo(‑3,‑14);ctx.lineTo(3,‑14);ctx.lineTo(3,‑5);ctx.lineTo(8,‑8);ctx.lineTo(0,12);ctx.stroke();
+ctx.beginPath();ctx.moveTo(0,12);ctx.lineTo(0,‑12);ctx.stroke();ctx.restore();}
+function drawEnemy1(e){ctx.save();ctx.translate(e.x,e.y);ctx.strokeStyle="#8cf";ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(0,10);ctx.lineTo(‑10,‑6);ctx.lineTo(0,‑18);ctx.lineTo(10,‑6);ctx.lineTo(0,10);ctx.stroke();
+ctx.beginPath();ctx.moveTo(0,10);ctx.lineTo(0,‑18);ctx.stroke();ctx.restore();}
+function drawEnemy2(e){ctx.save();ctx.translate(e.x,e.y);ctx.strokeStyle="#fd0";ctx.lineWidth=2;
+ctx.beginPath();ctx.moveTo(0,16);ctx.lineTo(‑14,‑10);ctx.lineTo(‑6,‑10);ctx.lineTo(‑6,‑16);ctx.lineTo(6,‑16);ctx.lineTo(6,‑10);ctx.lineTo(14,‑10);ctx.lineTo(0,16);ctx.stroke();
+ctx.beginPath();ctx.moveTo(0,16);ctx.lineTo(0,‑16);ctx.stroke();ctx.restore();}
+function drawEnemy3(e){ctx.save();ctx.translate(e.x,e.y);ctx.strokeStyle="#8f8";ctx.lineWidth=1.2;
+ctx.beginPath();ctx.moveTo(0,12);ctx.lineTo(‑9,‑7);ctx.lineTo(0,‑14);ctx.lineTo(9,‑7);ctx.lineTo(0,12);ctx.stroke();
+ctx.beginPath();ctx.moveTo(0,12);ctx.lineTo(0,‑14);ctx.stroke();ctx.restore();}
+function drawEnemy4(e){ctx.save();ctx.translate(e.x,e.y);ctx.strokeStyle="#c6f";ctx.lineWidth=1.5;
+ctx.beginPath();ctx.moveTo(0,14);ctx.lineTo(‑11,‑7);ctx.lineTo(0,‑16);ctx.lineTo(11,‑7);ctx.lineTo(0,14);ctx.stroke();
+ctx.beginPath();ctx.moveTo(0,14);ctx.lineTo(0,‑16);ctx.stroke();ctx.restore();}
+function drawEnemy6(e){ctx.save();ctx.translate(e.x,e.y);ctx.strokeStyle="#f94";ctx.lineWidth=1.5;
+ctx.beginPath();ctx.arc(0,0,12,0,Math.PI*2);ctx.moveTo(‑6,‑6);ctx.lineTo(6,6);ctx.moveTo(6,‑6);ctx.lineTo(‑6,6);ctx.stroke();ctx.restore();}
+function drawBoss(b){
+    ctx.save();ctx.translate(b.x,b.y);
+    if(b.phase ===1){
+        ctx.strokeStyle="#f22";ctx.lineWidth=2;
+        ctx.beginPath();ctx.moveTo(‑50,0);ctx.lineTo(0,‑35);ctx.lineTo(50,0);ctx.lineTo(0,35);ctx.lineTo(‑50,0);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(‑50,0);ctx.lineTo(‑70,12);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(50,0);ctx.lineTo(70,12);ctx.stroke();
+    }else{
+        ctx.strokeStyle="#a2f";ctx.lineWidth=3;
+        ctx.beginPath();ctx.moveTo(‑60,0);ctx.lineTo(‑20,‑40);ctx.lineTo(20,‑40);ctx.lineTo(60,0);ctx.lineTo(20,40);ctx.lineTo(‑20,40);ctx.lineTo(‑60,0);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(‑60,0);ctx.lineTo(‑80,18);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(60,0);ctx.lineTo(80,18);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(‑30,‑20);ctx.lineTo(‑45,‑35);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(30,‑20);ctx.lineTo(45,‑35);ctx.stroke();
+    }
+    ctx.restore();
+    const barW=120,barH=8;
+    const hpRatio = b.hp / b.maxHp;
+    ctx.fillStyle="#333";ctx.fillRect(b.x‑barW/2,b.y‑55,barW,barH);
+    ctx.fillStyle = b.phase===1?"#f33":"#a2f";
+    ctx.fillRect(b.x‑barW/2,b.y‑55,barW*hpRatio,barH);
+    ctx.strokeStyle="#fff";ctx.strokeRect(b.x‑barW/2,b.y‑55,barW,barH);
+    ctx.fillStyle="#fff";ctx.font="12px sans‑serif";
+    ctx.fillText(`阶段${b.phase}`,b.x‑22,b.y‑60);
+}
+function drawBullet(b){
+    ctx.save();ctx.translate(b.x,b.y);
+    if(b.heavy){ctx.strokeStyle="#ff8822";ctx.lineWidth=3;ctx.beginPath();ctx.arc(0,0,7,0,Math.PI*2);ctx.stroke();}
+    else{ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,‑4);ctx.lineTo(0,4);ctx.stroke();}
+    ctx.restore();
+}
+function drawEnemyBullet(b){
+    ctx.save();ctx.translate(b.x,b.y);ctx.fillStyle="#f44";ctx.beginPath();ctx.arc(0,0,3,0,Math.PI*2);ctx.fill();ctx.restore();
+}
+function drawTrackMissile(m){
+    ctx.save();ctx.translate(m.x,m.y);ctx.strokeStyle="#4f8";ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(0,‑6);ctx.lineTo(‑4,6);ctx.lineTo(4,6);ctx.closePath();ctx.stroke();ctx.restore();
+}
+function drawBuffItem(it){
+    ctx.save();ctx.translate(it.x,it.y);ctx.lineWidth=2;
+    switch(it.type){
+        case 0: ctx.strokeStyle="#4cf"; drawStar(0,0,5,10,5); break;
+        case 1: ctx.strokeStyle="#ff4"; ctx.beginPath();ctx.moveTo(0,‑10);ctx.lineTo(‑8,8);ctx.lineTo(8,8);ctx.closePath();ctx.stroke();break;
+        case 2: ctx.strokeStyle="#0ff"; ctx.beginPath();ctx.arc(0,0,10,0,Math.PI*2);ctx.stroke();break;
+        case 3: ctx.strokeStyle="#f44"; ctx.beginPath();ctx.moveTo(0,‑8);ctx.lineTo(0,8);ctx.moveTo(‑8,0);ctx.lineTo(8,0);ctx.stroke();break;
+        case 4: ctx.strokeStyle="#c4f"; ctx.beginPath();ctx.moveTo(0,‑10);ctx.lineTo(10,0);ctx.lineTo(0,10);ctx.lineTo(‑10,0);ctx.closePath();ctx.stroke();break;
+        case 5: ctx.strokeStyle="#f80"; drawStar(0,0,8,10,5); break;
+        case 6: ctx.strokeStyle="#4f8"; drawSpiral(0,0,10); break;
+        case 7: ctx.strokeStyle="#0cf"; ctx.beginPath();ctx.moveTo(0,‑10);ctx.lineTo(‑8,8);ctx.lineTo(8,8);ctx.closePath();ctx.stroke();break;
+        case 8: ctx.strokeStyle="#ff8822"; ctx.beginPath();ctx.arc(0,0,10,0,Math.PI*2);ctx.stroke();break;
+        case9: ctx.strokeStyle="#ff3333"; ctx.beginPath();ctx.moveTo(‑10,‑6);ctx.lineTo(0,‑10);ctx.lineTo(10,‑6);ctx.lineTo(0,6);ctx.closePath();ctx.stroke();break;
+        case10: ctx.strokeStyle="#aaddff"; drawHexagon(0,0,10); break;
+    }
+    ctx.restore();
+}
+function drawHexagon(x,y,r){
+    ctx.beginPath();for(let i=0;i<6;i++){
+        const ang = i*Math.PI/3;
+        const px=x+Math.cos(ang)*r;const py=y+Math.sin(ang)*r;
+        i===0?ctx.moveTo(px,py):ctx.lineTo(px,py);
+    }
+    ctx.closePath();ctx.stroke();
+}
+function drawStar(cx,cy,r,outer,inner){
+    ctx.beginPath();for(let i=0;i<2*r;i++){
+        const rad=i*Math.PI/r;
+        const rr=i%2===0?outer:inner;
+        const x=cx+Math.cos(rad)*rr;const y=cy+Math.sin(rad)*rr;
+        i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }
+    ctx.closePath();ctx.stroke();
+}
+function drawSpiral(cx,cy,maxR){
+    ctx.beginPath();for(let i=0;i<120;i++){
+        const t=i*0.12;const r=t*0.25;
+        if(r>maxR)break;
+        const x=cx+Math.cos(t)*r;const y=cy+Math.sin(t)*r;
+        i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+}
+function drawExplosion(exp){
+    ctx.save();ctx.translate(exp.x,exp.y);
+    const progress=1‑exp.timer/0.4;const r=exp.maxR*progress;
+    ctx.strokeStyle="#fff";ctx.lineWidth=1;
+    for(let i=0;i<8;i++){
+        const ang=i*Math.PI/4;
+        ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(ang)*r,Math.sin(ang)*r);ctx.stroke();
+    }
+    ctx.restore();
+}
+function createRandomBuff(x,y){
+    let rand=Math.random();let buffType;
+    if(rand<0.10)buffType=2;
+    else if(rand<0.20)buffType=3;
+    else{
+        const list=[0,1,4,5,6,7,8,9,10];
+        buffType=list[Math.floor(Math.random()*list.length)];
+    }
+    buffItems.push({x:x,y:y,type:buffType});
+}
+
+function resetGame(){
+    score=0;life=3;gameOver=false;pause=false;bossSpawned=false;level=1;
+    ultimateCd=0;ultimateInvincibleTimer=0;tipText="";tipTimer=0;
+    wingDrones=[false,false];buffDroneEnhance=false;
+    bullets=[];enemyBullets=[];enemies=[];buffItems=[];trackMissiles=[];explosions=[];boss=null;spawnTimer=0;
+    player.x=W/2;player.y=H‑100;player.clearStageBuff();
+}
+
+let lastTime=performance.now();
+function loop(now){
+    const dt=Math.min((now‑lastTime)/1000,0.05);lastTime=now;
+    ctx.fillStyle="#000";ctx.fillRect(0,0,W,H);
+
+    if(!remotePeerReady){
+        requestAnimationFrame(loop);
+        return;
+    }
+
+    if(ultimateCd>0)ultimateCd‑=dt;
+    if(ultimateInvincibleTimer>0)ultimateInvincibleTimer‑=dt;
+    if(tipTimer>0)tipTimer‑=dt;
+
+    const bossNeedScore=BOSS_SCORE_TABLE[level]??999999;
+    if(score>=bossNeedScore&&boss===null&&!bossSpawned)spawnBoss();
+
+    if(tipTimer>0){
+        ctx.fillStyle="#fff";ctx.font="18px sans‑serif";ctx.textAlign="center";
+        ctx.fillText(tipText,W/2,H/2‑80);ctx.textAlign="left";
+    }
+
+    if(pause||gameOver){
+        if(gameOver){showRankPanel(score);}
+        else{ctx.fillStyle="#fff";ctx.font="24px sans‑serif";ctx.fillText("游戏暂停（点击画布继续）",60,360);}
+        requestAnimationFrame(loop);
+        return;
+    }
+
+    player.update(dt);player.draw();
+    spawnTimer+=dt;
+    if(boss===null&&spawnTimer>1.2){spawnTimer=0;spawnEnemy();}
+
+    for(let i=bullets.length‑1;i>=0;i--){
+        const b=bullets[i];b.x+=b.vx;b.y+=b.vy;drawBullet(b);
+        if(b.y<‑10){bullets.splice(i,1);continue;}
+        for(let j=enemies.length‑1;j>=0;j--){
+            const e=enemies[j];
+            if(dist(b,e)<22){
+                e.hp‑=b.dmg;if(!b.pierce)bullets.splice(i,1);
+                if(e.hp<=0){
+                    score+=e.score;createExplosion(e.x,e.y);
+                    if(Math.random()<0.35)createRandomBuff(e.x,e.y);
+                    enemies.splice(j,1);
+                }
+                break;
+            }
+        }
+        if(boss&&dist(b,boss)<40){
+            boss.hp‑=b.dmg;if(!b.pierce)bullets.splice(i,1);
+            if(boss.hp<=boss.maxHp*0.5&&boss.phase===1){boss.phase=2;boss.shootRate*=0.65;}
+            if(boss.hp<=0){
+                score+=1000;createExplosion(boss.x,boss.y);boss=null;level+=1;
+                showTip(`✅ BOSS击杀！进入第${level}关！`,2.5);
+                enemies=[];enemyBullets=[];player.clearStageBuff();
+            }
+        }
+    }
+
+    for(let i=trackMissiles.length‑1;i>=0;i--){
+        const m=trackMissiles[i];
+        if((m.target&&m.target.hp<=0)||(!enemies.includes(m.target)&&boss!==m.target)){trackMissiles.splice(i,1);continue;}
+        const t=m.target;
+        const dx=t.x‑m.x;const dy=t.y‑m.y;const d=Math.sqrt(dx*dx+dy*dy);
+        const speed=6;
+        if(d>0){m.x+=(dx/d)*speed;m.y+=(dy/d)*speed;}
+        drawTrackMissile(m);
+        if(dist(m,t)<22){
+            t.hp‑=m.dmg;createExplosion(m.x,m.y);trackMissiles.splice(i,1);
+            if(t.hp<=0){
+                if(t===boss){
+                    score+=1000;boss=null;level+=1;
+                    showTip(`✅ BOSS击杀！进入第${level}关！`,2.5);
+                    enemies=[];enemyBullets=[];player.clearStageBuff();
+                }else{
+                    score+=t.score;createExplosion(t.x,t.y);
+                    if(Math.random()<0.35)createRandomBuff(t.x,t.y);
+                    enemies.splice(enemies.indexOf(t),1);
+                }
+            }
+        }
+        if(m.y<‑10||m.x<0||m.x>W)trackMissiles.splice(i,1);
+    }
+
+    for(let i=enemies.length‑1;i>=0;i--){
+        const e=enemies[i];e.time+=dt;e.shootCd‑=dt;
+        switch(e.moveType){
+            case 0:e.y+=e.spd;break;
+            case1:e.y+=e.spd;e.x=e.baseX+Math.sin(e.time*2.2)*60;break;
+            case2:e.y+=e.spd;const dir=e.baseX<W/2?1:‑1;e.x+=dir*e.spd*0.6;break;
+            case3:e.y+=e.spd*0.85;e.x=e.baseX+Math.sin(e.time*3.5)*75;break;
+            case4:
+                if(e.turnFlag){e.y+=e.spd;if(e.y>H*0.45)e.turnFlag=false;}
+                else{e.y‑=e.spd*0.8;if(e.y<H*0.15)e.turnFlag=true;}break;
+            case6:
+                const dxP=player.x‑e.x;const dyP=player.y‑e.y;
+                const dPlayer=Math.sqrt(dxP*dxP+dyP*dyP);
+                if(dPlayer<140)e.dashTrigger=true;
+                if(e.dashTrigger){if(dPlayer>0){e.x+=(dxP/dPlayer)*e.spd*1.8;e.y+=(dyP/dPlayer)*e.spd*1.8;}}
+                else{e.y+=e.spd*0.6;}break;
+        }
+        e.x=Math.max(20,Math.min(W‑20,e.x));
+        if(e.shootCd<=0){
+            e.shootCd=e.shootRate;
+            if(e.moveType===4){
+                for(let a=‑2;a<=2;a++){
+                    const ang=a*0.35;
+                    enemyBullets.push({x:e.x,y:e.y+10,vx:Math.sin(ang)*3,vy:Math.cos(ang)*3.2});
+                }
+            }else{
+                if(Math.random()<0.35){
+                    const dir=Math.random()>0.5?1:‑1;
+                    enemyBullets.push({x:e.x,y:e.y+10,vx:3*dir,vy:2});
+                }else{
+                    enemyBullets.push({x:e.x,y:e.y+10,vx:0,vy:4});
+                }
+            }
+        }
+        if(e.moveType===0)drawEnemy0(e);
+        else if(e.moveType===1)drawEnemy1(e);
+        else if(e.moveType===2)drawEnemy2(e);
+        else if(e.moveType===3)drawEnemy3(e);
+        else if(e.moveType===4)drawEnemy4(e);
+        else if(e.moveType===6)drawEnemy6(e);
+
+        if(e.moveType===4&&e.y<‑30){enemies.splice(i,1);continue;}
+        if(e.y>H+20){enemies.splice(i,1);continue;}
+        if(e.moveType===6&&dist(e,player)<22&&!player.hasShield&&ultimateInvincibleTimer<=0){
+            life‑‑;player.hitFlash=1;createExplosion(e.x,e.y);enemies.splice(i,1);
+            if(life<=0)gameOver=true;continue;
+        }
+    }
+
+    for(let j=enemyBullets.length‑1;j>=0;j--){
+        const eb=enemyBullets[j];eb.x+=eb.vx;eb.y+=eb.vy;drawEnemyBullet(eb);
+        if(eb.y>H+20||eb.x<0||eb.x>W){enemyBullets.splice(j,1);continue;}
+        if(dist(eb,player)<18&&!player.hasShield&&ultimateInvincibleTimer<=0){
+            life‑‑;player.hitFlash=1;createExplosion(eb.x,eb.y);enemyBullets.splice(j,1);
+            if(life<=0)gameOver=true;
+        }
+    }
+
+    if(boss){
+        boss.y=Math.min(120,boss.y+1.2);boss.x+=Math.sin(now/600)*1.8;boss.shootCd‑=dt;
+        if(boss.shootCd<=0){
+            boss.shootCd=boss.shootRate;
+            if(boss.phase===1){
+                for(let a=0;a<8;a++){
+                    const ang=a*Math.PI/4;
+                    enemyBullets.push({x:boss.x,y:boss.y+30,vx:Math.cos(ang)*3,vy:Math.sin(ang)*3});
+                }
+            }else{
+                for(let a=0;a<12;a++){
+                    const ang=a*Math.PI/6;
+                    enemyBullets.push({x:boss.x,y:boss.y+30,vx:Math.cos(ang)*3.2,vy:Math.sin(ang)*3.2});
+                }
+            }
+        }
+        drawBoss(boss);
+        if(dist(boss,player)<45&&!player.hasShield&&ultimateInvincibleTimer<=0){
+            life‑‑;player.hitFlash=1;if(life<=0)gameOver=true;
+        }
+    }
+
+    for(let i=buffItems.length‑1;i>=0;i--){
+        const it=buffItems[i];it.y+=2.2;drawBuffItem(it);
+        if(dist(it,player)<24){player.applyBuff(it.type);buffItems.splice(i,1);continue;}
+        if(it.y>H+20)buffItems.splice(i,1);
+    }
+
+    for(let i=explosions.length‑1;i>=0;i--){
+        const exp=explosions[i];exp.timer‑=dt;drawExplosion(exp);
+        if(exp.timer<=0)explosions.splice(i,1);
+    }
+
+    ctx.fillStyle="#fff";ctx.font="16px sans‑serif";
+    ctx.fillText(`分数:${score}`,10,20);
+    ctx.fillText(`生命:${life}`,10,40);
+    ctx.fillText(`关卡:${level}`,10,80);
+    if(ultimateCd>0){ctx.fillText(`大招CD:${ultimateCd.toFixed(1)}`,10,60);}
+    else{ctx.fillText("大招就绪(双击屏幕)",10,60);}
+
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
